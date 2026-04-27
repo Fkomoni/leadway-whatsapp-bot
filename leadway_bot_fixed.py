@@ -148,10 +148,18 @@ def lookup_member_for_id(phone_number: str) -> dict:
             other = member_data.get("Member_othernames", "")
             customer_name = f"{first} {surname} {other}".strip()
         
+        scheme_id = (
+            member_data.get("Member_SchemeID") or
+            member_data.get("SchemeID") or
+            member_data.get("PlanCode") or
+            member_data.get("Member_PlanCode")
+        )
+
         return {
             "found": True,
             "enrollee_id": enrollee_id,
-            "name": customer_name
+            "name": customer_name,
+            "scheme_id": scheme_id
         }
     except Exception as e:
         print(f"[ERROR] {e}")
@@ -164,10 +172,10 @@ def lookup_member_by_email(email: str) -> dict:
         "EnrolleeProfile/GetEnrolleeBioDataByEmail",
         params={"email": email}
     )
-    
+
     if not result:
         return {"found": False}
-    
+
     # Handle response structure
     if isinstance(result, dict):
         if result.get("status") == 200 and result.get("result"):
@@ -176,21 +184,29 @@ def lookup_member_by_email(email: str) -> dict:
             member_data = result
     else:
         member_data = result
-    
+
     # Extract using correct field names
     enrollee_id = member_data.get("Member_EnrolleeID")
     customer_name = member_data.get("Member_CustomerName")
-    
+
     if not customer_name:
         first = member_data.get("Member_FirstName", "")
         surname = member_data.get("Member_Surname", "")
         other = member_data.get("Member_othernames", "")
         customer_name = f"{first} {surname} {other}".strip()
-    
+
+    scheme_id = (
+        member_data.get("Member_SchemeID") or
+        member_data.get("SchemeID") or
+        member_data.get("PlanCode") or
+        member_data.get("Member_PlanCode")
+    )
+
     return {
         "found": True,
         "enrollee_id": enrollee_id,
-        "name": customer_name
+        "name": customer_name,
+        "scheme_id": scheme_id
     }
 
 @tool
@@ -347,7 +363,70 @@ def check_benefits(enrollee_id: str, benefit_type: str = "all") -> dict:
         "benefits": benefits_list
     }
 
-TOOLS = [lookup_member_for_id, lookup_member_by_email, get_dependants, check_benefits]
+@tool
+def get_accessible_gyms(scheme_id: str) -> dict:
+    """
+    Get the list of gyms and spas a member can access based on their plan/scheme.
+
+    Args:
+        scheme_id: The member's scheme/plan ID (obtained from member lookup)
+
+    Returns:
+        dict with found and list of gyms
+    """
+    result = api_client.get(
+        "ListValues/GetGeneralGymandSpaByPlanCode",
+        params={
+            "SchemeID": scheme_id,
+            "MinimumID": 0,
+            "NoOfRecords": 100,
+            "pageSize": 0,
+        }
+    )
+
+    print(f"[GYMS DEBUG] Raw response: {json.dumps(result, indent=2)}")
+
+    if not result:
+        return {"found": False, "message": "Unable to retrieve gym information"}
+
+    if isinstance(result, dict):
+        if result.get("status") == 200 and result.get("result"):
+            gyms_data = result["result"]
+        else:
+            gyms_data = result
+    else:
+        gyms_data = result
+
+    if not gyms_data:
+        return {"found": False, "message": "No gyms found for your plan"}
+
+    gyms_list = []
+    items = gyms_data if isinstance(gyms_data, list) else [gyms_data]
+    for item in items:
+        name = (
+            item.get("GymName") or item.get("Name") or
+            item.get("FacilityName") or item.get("ProviderName") or "Unknown"
+        )
+        address = (
+            item.get("Address") or item.get("GymAddress") or
+            item.get("Location") or ""
+        )
+        state = item.get("State") or item.get("StateName") or ""
+        phone = item.get("PhoneNo") or item.get("Phone") or item.get("ContactPhone") or ""
+        gyms_list.append({
+            "name": name,
+            "address": address,
+            "state": state,
+            "phone": phone,
+        })
+
+    return {
+        "found": True,
+        "count": len(gyms_list),
+        "gyms": gyms_list,
+    }
+
+TOOLS = [lookup_member_for_id, lookup_member_by_email, get_dependants, check_benefits, get_accessible_gyms]
 
 # ============================================================================
 # SYSTEM PROMPT
@@ -363,13 +442,15 @@ Good morning! I'm Favour from Leadway Health. How can I help?
 1. Get My Member ID
 2. Check My Benefit Limits
 3. Find My Dependants
-4. Talk to Agent
+4. Find Accessible Gyms & Spas
+5. Talk to Agent
 
 AVAILABLE TOOLS:
-- lookup_member_for_id: Search by phone number
-- lookup_member_by_email: Search by email
+- lookup_member_for_id: Search by phone number (also returns scheme_id)
+- lookup_member_by_email: Search by email (also returns scheme_id)
 - get_dependants: Get list of dependants (requires enrollee ID)
 - check_benefits: Check benefit limits (requires enrollee ID and benefit type)
+- get_accessible_gyms: Get gyms/spas the member can access (requires scheme_id from lookup)
 
 CRITICAL TOOL CALLING RULES:
 - When you see 11-digit phone (07x/08x/09x) → IMMEDIATELY call lookup_member_for_id
@@ -421,7 +502,14 @@ When member asks about dependants:
 1. If you have their enrollee ID → IMMEDIATELY call get_dependants
 2. Return list: "[Name] ([Relationship]) - [ID]"
 
-Keep responses SHORT and DIRECT. Use their enrollee ID if you already have it from earlier in the conversation."""
+OPTION 4 - GYMS & SPAS:
+When member asks about accessible gyms or fitness centres:
+1. If you don't have their scheme_id → do a member lookup first (phone/email)
+2. Call get_accessible_gyms with the scheme_id from the lookup result
+3. Format as a numbered list: "[N]. [Name] - [Address], [State]"
+4. If phone is shown, include it: "Tel: [phone]"
+
+Keep responses SHORT and DIRECT. Use their enrollee ID/scheme_id if you already have it from earlier in the conversation."""
 
 # ============================================================================
 # BOT - FIXED TOOL CALLING
