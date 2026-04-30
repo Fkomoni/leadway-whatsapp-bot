@@ -347,7 +347,252 @@ def check_benefits(enrollee_id: str, benefit_type: str = "all") -> dict:
         "benefits": benefits_list
     }
 
-TOOLS = [lookup_member_for_id, lookup_member_by_email, get_dependants, check_benefits]
+@tool
+def get_screening_package(enrollee_id: str) -> dict:
+    """
+    Get the list of tests/services covered under a member's annual screening package.
+    Use this when the user asks things like:
+      - "What tests am I covered for?"
+      - "List of tests under my annual screening"
+      - "What's in my screening package?"
+      - "What does my health check include?"
+
+    Args:
+        enrollee_id: Member's enrollee ID (e.g., 21000645/0)
+
+    Returns:
+        dict with found, package_name, test_count, and tests (list of covered test names)
+    """
+    cif_number = enrollee_id.split('/')[0] if '/' in enrollee_id else enrollee_id
+
+    # Try multiple likely endpoints; the first one that returns data wins.
+    endpoints = [
+        os.getenv("LEADWAY_SCREENING_PACKAGE_ENDPOINT"),
+        "EnrolleeProfile/GetEnrolleeBenefitsByCif_AnnualScreening",
+        "EnrolleeProfile/GetEnrolleeBenefitsByCif_Screening",
+        "EnrolleeProfile/GetEnrolleeScreeningPackageByCif",
+        "EnrolleeProfile/GetScreeningPackageByCif",
+    ]
+
+    result = None
+    used_endpoint = None
+    for endpoint in endpoints:
+        if not endpoint:
+            continue
+        print(f"[SCREENING] Trying endpoint: {endpoint}")
+        result = api_client.get(endpoint, params={"cifno": cif_number})
+        if result:
+            used_endpoint = endpoint
+            break
+
+    print(f"[SCREENING] RAW RESPONSE from {used_endpoint}:")
+    print(json.dumps(result, indent=2, default=str))
+
+    if not result:
+        return {
+            "found": False,
+            "message": "Unable to retrieve screening package right now. Please try again shortly."
+        }
+
+    data = None
+    if isinstance(result, dict):
+        if result.get("status") == 200 and result.get("result") is not None:
+            data = result["result"]
+        else:
+            data = result
+    elif isinstance(result, list):
+        data = result
+
+    if not data:
+        return {"found": False, "tests": [], "message": "No screening package data available"}
+
+    tests = []
+    package_name = None
+
+    def _extract_test_name(item: dict) -> Optional[str]:
+        return (
+            item.get("TestName")
+            or item.get("ServiceName")
+            or item.get("BenefitName")
+            or item.get("Test")
+            or item.get("Name")
+            or item.get("Description")
+        )
+
+    items = data if isinstance(data, list) else [data]
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if not package_name:
+            package_name = item.get("PackageName") or item.get("Package") or item.get("PlanName")
+
+        nested = (
+            item.get("Tests")
+            or item.get("Services")
+            or item.get("CoveredTests")
+            or item.get("Benefits")
+        )
+        if isinstance(nested, list):
+            for n in nested:
+                if isinstance(n, str):
+                    tests.append(n)
+                elif isinstance(n, dict):
+                    name = _extract_test_name(n)
+                    if name:
+                        tests.append(name)
+            continue
+
+        name = _extract_test_name(item)
+        if name:
+            tests.append(name)
+
+    # De-duplicate while preserving order
+    seen = set()
+    unique_tests = []
+    for t in tests:
+        key = t.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique_tests.append(t.strip())
+
+    return {
+        "found": len(unique_tests) > 0,
+        "package_name": package_name,
+        "test_count": len(unique_tests),
+        "tests": unique_tests,
+    }
+
+
+@tool
+def get_screening_providers(state: str = "", area: str = "") -> dict:
+    """
+    Get the list of approved annual-screening centers/providers.
+    Use this when the user asks about screening centers, hospitals,
+    locations, or providers — e.g.
+      - "Where can I do my screening?"
+      - "Is Clinix Healthcare on the list?"
+      - "Any centers in Ilupeju?"
+      - "Show me screening centers in Lagos"
+
+    Always call this tool. Never list centers from memory.
+
+    Args:
+        state: Nigerian state name (e.g., 'Lagos'). Optional.
+        area: Specific area/LGA/town (e.g., 'Ilupeju', 'Ikeja'). Optional.
+
+    Returns:
+        dict with found, count, and providers (list of {name, address, state, area, phone}).
+    """
+    endpoints = [
+        os.getenv("LEADWAY_SCREENING_PROVIDERS_ENDPOINT"),
+        "Provider/GetScreeningProviders",
+        "Provider/GetScreeningProvidersByState",
+        "Provider/GetProvidersByState",
+        "Hospital/GetScreeningHospitals",
+    ]
+
+    params = {}
+    if state:
+        params["state"] = state
+    if area:
+        params["area"] = area
+
+    result = None
+    used_endpoint = None
+    for endpoint in endpoints:
+        if not endpoint:
+            continue
+        print(f"[PROVIDERS] Trying endpoint: {endpoint} with params {params}")
+        result = api_client.get(endpoint, params=params or None)
+        if result:
+            used_endpoint = endpoint
+            break
+
+    print(f"[PROVIDERS] RAW RESPONSE from {used_endpoint}:")
+    print(json.dumps(result, indent=2, default=str))
+
+    if not result:
+        return {
+            "found": False,
+            "providers": [],
+            "message": "Unable to retrieve screening providers right now."
+        }
+
+    data = None
+    if isinstance(result, dict):
+        if result.get("status") == 200 and result.get("result") is not None:
+            data = result["result"]
+        else:
+            data = result
+    elif isinstance(result, list):
+        data = result
+
+    if not data:
+        return {"found": False, "providers": [], "message": "No providers found."}
+
+    items = data if isinstance(data, list) else [data]
+    providers_list = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = (
+            item.get("ProviderName")
+            or item.get("HospitalName")
+            or item.get("CentreName")
+            or item.get("CenterName")
+            or item.get("Name")
+        )
+        if not name:
+            continue
+        providers_list.append({
+            "name": name,
+            "address": item.get("Address") or item.get("Location") or item.get("StreetAddress"),
+            "state": item.get("State") or item.get("StateName"),
+            "area": item.get("Area") or item.get("LGA") or item.get("City") or item.get("Town"),
+            "phone": item.get("Phone") or item.get("PhoneNumber") or item.get("Telephone"),
+        })
+
+    # Optional client-side filter when API returns the full list.
+    filtered = providers_list
+    if area:
+        needle = area.strip().lower()
+        area_matches = [
+            p for p in providers_list
+            if (p.get("area") and needle in p["area"].lower())
+            or (p.get("address") and needle in p["address"].lower())
+            or (p.get("name") and needle in p["name"].lower())
+        ]
+        if area_matches:
+            filtered = area_matches
+    if state and filtered is providers_list:
+        needle = state.strip().lower()
+        state_matches = [
+            p for p in providers_list
+            if (p.get("state") and needle in p["state"].lower())
+            or (p.get("address") and needle in p["address"].lower())
+        ]
+        if state_matches:
+            filtered = state_matches
+
+    return {
+        "found": len(filtered) > 0,
+        "state": state or None,
+        "area": area or None,
+        "count": len(filtered),
+        "total_returned_by_api": len(providers_list),
+        "providers": filtered,
+    }
+
+
+TOOLS = [
+    lookup_member_for_id,
+    lookup_member_by_email,
+    get_dependants,
+    check_benefits,
+    get_screening_package,
+    get_screening_providers,
+]
 
 # ============================================================================
 # SYSTEM PROMPT
@@ -363,21 +608,27 @@ Good morning! I'm Favour from Leadway Health. How can I help?
 1. Get My Member ID
 2. Check My Benefit Limits
 3. Find My Dependants
-4. Talk to Agent
+4. Annual Screening
+5. Talk to Agent
 
 AVAILABLE TOOLS:
 - lookup_member_for_id: Search by phone number
 - lookup_member_by_email: Search by email
 - get_dependants: Get list of dependants (requires enrollee ID)
 - check_benefits: Check benefit limits (requires enrollee ID and benefit type)
+- get_screening_package: Get the list of tests covered under the member's annual screening (requires enrollee ID)
+- get_screening_providers: Get approved screening centers/providers, optionally filtered by state and/or area
 
 CRITICAL TOOL CALLING RULES:
 - When you see 11-digit phone (07x/08x/09x) → IMMEDIATELY call lookup_member_for_id
 - When you see email with @ → IMMEDIATELY call lookup_member_by_email
 - When user asks about dependants → call get_dependants with their enrollee ID
 - When user asks about benefits → call check_benefits with their enrollee ID
+- When user asks "what tests am I covered for", "list of tests", "what's in my screening package", "what does my health check include" → call get_screening_package with their enrollee ID
+- When user asks about screening centers/locations/providers/hospitals (e.g. "any centers in Ilupeju?", "is Clinix Healthcare on the list?", "screening centers in Lagos") → call get_screening_providers (pass state and/or area when mentioned)
 - If you have enrollee ID from earlier in conversation → use it
 - DO NOT ask for verification - just call tools
+- NEVER invent or guess screening tests, centers, hospitals, areas, or providers. If you don't have tool data, call the tool. If the tool returns nothing, say so honestly — do NOT make up a list.
 
 CRITICAL RESPONSE FORMATTING:
 - Benefits MUST show as: "Benefit Limit: N..." and "Benefit Balance: N..."
@@ -420,6 +671,27 @@ OPTION 3 - DEPENDANTS:
 When member asks about dependants:
 1. If you have their enrollee ID → IMMEDIATELY call get_dependants
 2. Return list: "[Name] ([Relationship]) - [ID]"
+
+OPTION 4 - ANNUAL SCREENING:
+When the member is in the annual screening flow:
+A) If they ask "what tests am I covered for", "list of tests", or anything about
+   what their screening package includes:
+   1. If you don't have their enrollee ID → get it first (phone/email lookup)
+   2. Call get_screening_package with their enrollee ID
+   3. Reply EXACTLY in this format:
+      "Your annual screening covers:
+      • Test 1
+      • Test 2
+      • Test 3"
+   4. If the tool returns no tests, say: "I couldn't pull up your covered tests right now. Please try again shortly or speak to an agent." Do NOT make up tests.
+
+B) If they ask about screening centers, locations, hospitals, or a specific
+   area/state (e.g. "any centers in Ilupeju?", "is Clinix Healthcare a partner?"):
+   1. Call get_screening_providers with the state and/or area they mentioned.
+      - For Lagos areas like Ilupeju, Ikeja, Yaba, Lekki, VI, Ikoyi, etc., pass state="Lagos" and area=<the area>.
+   2. List the actual providers returned by the tool — name, area, address.
+   3. If they asked about a specific provider (e.g. "Clinix Healthcare"), check the tool output and answer based on that.
+   4. If the tool returns no matches in that area, say so honestly AND list what IS available in nearby areas of the same state from the same tool result. NEVER fabricate locations.
 
 Keep responses SHORT and DIRECT. Use their enrollee ID if you already have it from earlier in the conversation."""
 
