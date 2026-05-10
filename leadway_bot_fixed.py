@@ -5,10 +5,11 @@ Proper tool calling with correct message flow
 """
 
 import os
+import re
 import time
 import json
 import requests
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -28,78 +29,79 @@ class LeadwayAPIClient:
         self.password = os.getenv("LEADWAY_API_PASSWORD")
         self.token = None
         self.token_expiry = 0
-    
+
     def login(self) -> bool:
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "LeadwayHealthBot/1.0"
-            }
-            
             response = requests.post(
                 f"{self.base_url}/ApiUsers/Login",
                 json={"Username": self.username, "Password": self.password},
-                headers=headers,
+                headers={"Content-Type": "application/json", "User-Agent": "PostmanRuntime/7.51.1"},
                 timeout=10
             )
-            
             if response.status_code == 200:
                 data = response.json()
+                inner = data.get("data") or data.get("Data") or data.get("result") or data.get("Result") or data
                 self.token = (
-                    data.get("token") or 
-                    data.get("Token") or 
-                    data.get("access_token") or
-                    data.get("AccessToken")
+                    inner.get("accessToken") or inner.get("token") or
+                    inner.get("AccessToken") or inner.get("Token") or
+                    inner.get("bearer") or inner.get("Bearer")
                 )
-                
                 if self.token:
-                    self.token_expiry = time.time() + 3600
+                    self.token_expiry = time.time() + 5 * 60 * 60  # 5 hours
                     print("✓ Connected to Leadway API")
                     return True
-                else:
-                    print(f"ERROR: No token in response. Keys: {list(data.keys())}")
-                    return False
+                print(f"ERROR: No token in response. Keys: {list(data.keys())}")
             else:
                 print(f"Login failed: {response.status_code} - {response.text}")
-                return False
-                
         except Exception as e:
             print(f"Login error: {e}")
-            return False
-    
+        return False
+
     def ensure_authenticated(self):
         if not self.token or time.time() >= self.token_expiry:
             if not self.login():
                 raise Exception("Failed to authenticate")
-    
-    def get(self, endpoint: str, params: Dict = None) -> Optional[Dict]:
+
+    def _make_request(self, method: str, endpoint: str, params: Dict = None, body: Dict = None) -> requests.Response:
         self.ensure_authenticated()
-        
+        url = f"{self.base_url}/{endpoint}"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "PostmanRuntime/7.51.1",
+        }
+        r = requests.request(method, url, params=params, json=body, headers=headers, timeout=10)
+        if r.status_code == 401:
+            self.token = None
+            self.ensure_authenticated()
+            headers["Authorization"] = f"Bearer {self.token}"
+            r = requests.request(method, url, params=params, json=body, headers=headers, timeout=10)
+        return r
+
+    def get(self, endpoint: str, params: Dict = None) -> Optional[Dict]:
         try:
-            headers = {
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "LeadwayHealthBot/1.0"
-            }
-            
-            response = requests.get(
-                f"{self.base_url}/{endpoint}",
-                params=params,
-                headers=headers,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                print(f"API error: {response.status_code}")
-                return None
-                
+            r = self._make_request("GET", endpoint, params=params)
+            return r.json() if r.status_code == 200 else None
         except Exception as e:
             print(f"Request error: {e}")
             return None
+
+    def post(self, endpoint: str, body: Dict = None) -> Optional[Dict]:
+        try:
+            r = self._make_request("POST", endpoint, body=body)
+            return r.json() if r.status_code == 200 else None
+        except Exception as e:
+            print(f"Request error: {e}")
+            return None
+
+
+def _extract_inner(data):
+    """Unwrap the API's status/result envelope."""
+    if not isinstance(data, dict):
+        return data
+    return data.get("data") or data.get("Data") or data.get("result") or data.get("Result") or data
+
 
 api_client = LeadwayAPIClient()
 
@@ -347,7 +349,191 @@ def check_benefits(enrollee_id: str, benefit_type: str = "all") -> dict:
         "benefits": benefits_list
     }
 
-TOOLS = [lookup_member_for_id, lookup_member_by_email, get_dependants, check_benefits]
+@tool
+def check_annual_screening_eligibility(enrollee_id: str) -> dict:
+    """
+    Check if a member is eligible for their annual health screening and return
+    the package name and list of tests included.
+
+    Args:
+        enrollee_id: Member's enrollee ID (e.g., 21000645/0)
+    """
+    try:
+        r = api_client._make_request("GET", "AnnualScreening/GetScreeningPackage",
+                                     params={"EnrolleeID": enrollee_id})
+        if r.status_code in (404, 405):
+            r = api_client._make_request("POST", "AnnualScreening/GetScreeningPackage",
+                                         body={"EnrolleeID": enrollee_id})
+        if r.status_code in (404, 501):
+            r = api_client._make_request("GET", "Production/GetHealthCheckEligibility",
+                                         params={"enrolleeid": enrollee_id})
+        if not r.ok:
+            return {"found": False, "message": "Unable to check eligibility"}
+
+        data = r.json()
+        inner = _extract_inner(data)
+        o = inner[0] if isinstance(inner, list) else inner
+
+        raw_tests = o.get("tests") or o.get("Tests") or []
+        tests = [
+            {"testName": t, "testCode": ""} if isinstance(t, str) else {
+                "testName": t.get("testname") or t.get("testName") or t.get("TestName", ""),
+                "testCode": t.get("testcode") or t.get("testCode") or t.get("TestCode", ""),
+            }
+            for t in raw_tests
+        ]
+
+        return {
+            "found": True,
+            "isEligible": bool(o.get("isEligible") or o.get("IsEligible")),
+            "memberName": o.get("memberName") or o.get("MemberName", ""),
+            "memberEmail": o.get("memberEmail") or o.get("MemberEmail", ""),
+            "age": o.get("age") or o.get("Age"),
+            "gender": o.get("gender") or o.get("Gender", ""),
+            "packageName": o.get("packageName") or o.get("PackageName", ""),
+            "nextEligibleDate": o.get("nextEligibleDate") or o.get("NextEligibleDate"),
+            "tests": tests,
+        }
+    except Exception as e:
+        print(f"[ERROR] check_annual_screening_eligibility: {e}")
+        return {"found": False, "error": str(e)}
+
+
+@tool
+def get_screening_providers(enrollee_id: str, state: str) -> dict:
+    """
+    Get the list of health screening providers available in a given Nigerian state.
+
+    Args:
+        enrollee_id: Member's enrollee ID
+        state: Nigerian state name, e.g. "Lagos", "Abuja", "Rivers"
+    """
+    try:
+        r = api_client._make_request("GET", "AnnualScreening/GetScreeningProviders",
+                                     params={"EnrolleeID": enrollee_id, "State": state})
+        if r.status_code in (404, 405):
+            r = api_client._make_request("POST", "AnnualScreening/GetScreeningProviders",
+                                         body={"EnrolleeID": enrollee_id, "State": state})
+        if r.status_code in (404, 501):
+            r = api_client._make_request("GET", "Production/GetHealthCheckProviders",
+                                         params={"enrolleeid": enrollee_id, "Region": state})
+        if not r.ok:
+            return {"found": False, "providers": [], "message": f"No providers found in {state}"}
+
+        data = r.json()
+        inner = _extract_inner(data)
+        raw_list = inner if isinstance(inner, list) else (inner.get("providers") or inner.get("Providers") or [])
+
+        providers = []
+        for x in raw_list:
+            name = (x.get("provider") or x.get("name") or x.get("Name") or x.get("ProviderName", "")).strip()
+            pid = str(x.get("ProviderCode") or x.get("providerCode") or x.get("NamasNo") or
+                      x.get("ProviderID") or x.get("provider_id", ""))
+            if not name:
+                continue
+            if re.search(r"dummy|deactivated|referrals only", name, re.IGNORECASE):
+                continue
+            if re.match(r"^[09]+$", pid):
+                continue
+            providers.append({
+                "id": pid,
+                "name": name,
+                "address": (x.get("ProviderAddress") or x.get("address", "")).strip(),
+                "town": (x.get("CityOfOrigin") or x.get("region") or x.get("town") or x.get("City", "")).strip(),
+                "state": (x.get("StateOfOrigin") or x.get("state", "")).strip(),
+                "phone": (x.get("phone1") or x.get("phone") or x.get("phone2", "")).strip(),
+                "email": (x.get("email") or x.get("Email", "")).strip(),
+            })
+
+        return {"found": True, "count": len(providers), "providers": providers}
+    except Exception as e:
+        print(f"[ERROR] get_screening_providers: {e}")
+        return {"found": False, "providers": [], "error": str(e)}
+
+
+@tool
+def book_annual_screening(enrollee_id: str, provider_id: str, preferred_date: str) -> dict:
+    """
+    Book an annual health screening appointment for a member.
+
+    Args:
+        enrollee_id: Member's enrollee ID
+        provider_id: 7-digit provider code from get_screening_providers
+        preferred_date: Date in YYYY-MM-DD format
+    """
+    try:
+        r = api_client._make_request("POST", "EnrolleeProfile/BookHealthCheck", body={
+            "EnrolleeID": enrollee_id,
+            "ProviderID": provider_id,
+            "PreferredDate": preferred_date,
+            "NotifyProvider": False,
+        })
+        data = r.json()
+        inner = _extract_inner(data)
+        o = inner[0] if isinstance(inner, list) else inner
+
+        if not (o.get("Success") or o.get("success")):
+            return {"success": False, "message": o.get("Message") or o.get("message", "Booking failed")}
+
+        raw_tests = o.get("Tests") or o.get("tests") or []
+        tests = [t if isinstance(t, str) else (t.get("testname") or t.get("testName") or t.get("TestName", ""))
+                 for t in raw_tests]
+
+        return {
+            "success": True,
+            "paCode": o.get("PACode") or o.get("pacode") or o.get("preauthorizationcode", ""),
+            "visitId": o.get("VisitID") or o.get("visitId", ""),
+            "memberName": o.get("MemberName") or o.get("membername", ""),
+            "providerName": o.get("ProviderName") or o.get("providername", ""),
+            "providerEmail": o.get("EmailAddress") or o.get("emailaddress") or o.get("ProviderEmail", ""),
+            "scheduledDate": o.get("ScheduledDate") or o.get("scheduleddate", ""),
+            "expiryDate": o.get("ExpiryDate") or o.get("expirydate", ""),
+            "packageName": o.get("PackageName") or o.get("packagename", ""),
+            "tests": tests,
+            "instructions": o.get("Instructions") or o.get("instructions", ""),
+        }
+    except Exception as e:
+        print(f"[ERROR] book_annual_screening: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@tool
+def cancel_annual_screening(visit_id: str) -> dict:
+    """
+    Cancel an existing annual health screening booking.
+
+    Args:
+        visit_id: The visit ID returned when the booking was made
+    """
+    try:
+        r = api_client._make_request("GET", "EnrolleeProfile/deletehealthcheck",
+                                     params={"visitid": visit_id})
+        data = None
+        try:
+            data = r.json()
+        except Exception:
+            pass
+        inner = _extract_inner(data) if data else None
+        success = r.ok and ((data and data.get("status") == 200) or isinstance(inner, list))
+        return {
+            "success": success,
+            "message": "Booking cancelled successfully" if success else "Cancellation failed",
+        }
+    except Exception as e:
+        print(f"[ERROR] cancel_annual_screening: {e}")
+        return {"success": False, "error": str(e)}
+
+
+TOOLS = [
+    lookup_member_for_id,
+    lookup_member_by_email,
+    get_dependants,
+    check_benefits,
+    check_annual_screening_eligibility,
+    get_screening_providers,
+    book_annual_screening,
+    cancel_annual_screening,
+]
 
 # ============================================================================
 # SYSTEM PROMPT
@@ -355,7 +541,7 @@ TOOLS = [lookup_member_for_id, lookup_member_by_email, get_dependants, check_ben
 
 SYSTEM_PROMPT = """You are Favour, healthcare assistant for Leadway Health in Nigeria.
 
-KEEP IT SHORT - Max 2-4 lines.
+KEEP IT SHORT - Max 2-4 lines per message.
 
 GREETING (ONLY ONCE):
 Good morning! I'm Favour from Leadway Health. How can I help?
@@ -363,19 +549,25 @@ Good morning! I'm Favour from Leadway Health. How can I help?
 1. Get My Member ID
 2. Check My Benefit Limits
 3. Find My Dependants
-4. Talk to Agent
+4. Book Annual Screening
+5. Talk to Agent
 
 AVAILABLE TOOLS:
 - lookup_member_for_id: Search by phone number
 - lookup_member_by_email: Search by email
 - get_dependants: Get list of dependants (requires enrollee ID)
 - check_benefits: Check benefit limits (requires enrollee ID and benefit type)
+- check_annual_screening_eligibility: Check eligibility + get package/tests (requires enrollee ID)
+- get_screening_providers: List providers in a state (requires enrollee ID + state)
+- book_annual_screening: Book appointment (requires enrollee ID, provider ID, date YYYY-MM-DD)
+- cancel_annual_screening: Cancel booking (requires visit ID)
 
 CRITICAL TOOL CALLING RULES:
 - When you see 11-digit phone (07x/08x/09x) → IMMEDIATELY call lookup_member_for_id
 - When you see email with @ → IMMEDIATELY call lookup_member_by_email
 - When user asks about dependants → call get_dependants with their enrollee ID
 - When user asks about benefits → call check_benefits with their enrollee ID
+- When user asks about annual screening → follow OPTION 4 flow below
 - If you have enrollee ID from earlier in conversation → use it
 - DO NOT ask for verification - just call tools
 
@@ -389,14 +581,14 @@ When member selects option 2 or asks about benefits:
 1. If you don't have their enrollee ID → get it first (phone/email lookup)
 2. Show benefit sub-menu:
    "Which benefit would you like to check?
-   
+
    1. Lens/Frames
    2. Dental
    3. Chronic Medications
    4. Surgery
    5. Major Disease
    6. All Benefits"
-   
+
 3. When they select → call check_benefits with enrollee ID and benefit type
 4. CRITICAL: Always format benefit responses EXACTLY like this:
 
@@ -404,22 +596,65 @@ When member selects option 2 or asks about benefits:
    "Dental:
    Benefit Limit: N30,000.00
    Benefit Balance: N25,000.00"
-   
+
    For multiple benefits:
    "Lens/Frames:
    Benefit Limit: N50,000.00
    Benefit Balance: N50,000.00
-   
+
    Dental:
    Benefit Limit: N30,000.00
    Benefit Balance: N25,000.00"
-   
+
    NEVER say "Balance N..." or "Limit: N..." - ALWAYS use "Benefit Limit:" and "Benefit Balance:"
 
 OPTION 3 - DEPENDANTS:
 When member asks about dependants:
 1. If you have their enrollee ID → IMMEDIATELY call get_dependants
 2. Return list: "[Name] ([Relationship]) - [ID]"
+
+OPTION 4 - BOOK ANNUAL SCREENING:
+Step-by-step flow:
+
+Step 1 - CHECK ELIGIBILITY:
+- Call check_annual_screening_eligibility with enrollee ID
+- If isEligible is false → tell member the nextEligibleDate and stop
+- If isEligible is true → show:
+  "Great news! You're eligible for your [packageName] screening.
+  Tests included: [list tests]
+
+  Which state would you like to visit a provider in?"
+
+Step 2 - GET PROVIDERS:
+- User gives a state name (e.g. "Lagos", "Abuja")
+- Call get_screening_providers with enrollee ID and state
+- If no providers → ask them to try a different state
+- Show numbered list (max 8 providers), format:
+  "1. [name] - [town] ([address])
+   2. ..."
+  Then ask: "Which provider would you like? Reply with the number."
+
+Step 3 - GET DATE:
+- User picks a number → store that provider's id and name
+- Ask: "What is your preferred date? (e.g. 2025-08-15)"
+
+Step 4 - CONFIRM & BOOK:
+- Call book_annual_screening with enrollee ID, provider id, and date
+- On success show:
+  "Booking confirmed!
+   PA Code: [paCode]
+   Provider: [providerName]
+   Date: [scheduledDate]
+   Expires: [expiryDate]
+   Package: [packageName]
+   Tests: [tests list]
+   [instructions if not empty]"
+- On failure → show the error message and ask if they want to try again
+
+CANCELLATION:
+- If member wants to cancel a screening → ask for their visit ID
+- Call cancel_annual_screening with the visit ID
+- Confirm success or failure
 
 Keep responses SHORT and DIRECT. Use their enrollee ID if you already have it from earlier in the conversation."""
 
@@ -525,8 +760,6 @@ class LeadwayHealthBot:
             self._wait_for_rate_limit()
             
             # FORCE TOOL CALLING: Detect phone numbers in multiple formats
-            import re
-            
             # Match phone numbers in various formats:
             # +2348188626141, 2348188626141, 08188626141, 081 88626141, etc.
             phone_patterns = [
