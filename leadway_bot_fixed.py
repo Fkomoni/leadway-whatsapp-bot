@@ -133,18 +133,78 @@ def _distance_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-# Shown only when the live API call fails entirely
-FALLBACK_GYMS = [
-    {"id": "", "name": "i-Fitness Centre", "address": "Various Lagos locations",
-     "state": "Lagos", "lga": "", "phone": "07002248772", "email": "info@ifitness.com.ng"},
-    {"id": "", "name": "Bodyline Fitness", "address": "Various Lagos locations",
-     "state": "Lagos", "lga": "", "phone": "", "email": ""},
-    {"id": "", "name": "Gym+ Abuja", "address": "Various Abuja locations",
-     "state": "FCT", "lga": "", "phone": "", "email": ""},
-]
-
-
 api_client = LeadwayAPIClient()
+
+PROVIDER_ENDPOINTS = {
+    "hospital": "GetProvidersByPlanCode",
+    "eye":      "GetEyeClinicByPlanCode",
+    "dental":   "GetDentalClinicByPlanCode",
+    "wellness": "GetGeneralGymandSpaByPlanCode",
+}
+
+_provider_cache: Dict[str, tuple] = {}
+_PROVIDER_CACHE_TTL = 10 * 60  # 10 minutes
+
+
+def _provider_score(p: dict) -> int:
+    return (4 if p["lat"] is not None else 0) + (2 if p["phone"] else 0) + (1 if p["address"] else 0)
+
+
+def _normalise_providers(raw_list) -> List[dict]:
+    """Normalise, dedupe, and filter a raw Prognosis provider list."""
+    normalised = []
+    for x in (raw_list or []):
+        name = ""
+        for f in [x.get("provider"), x.get("name"), x.get("Name"), x.get("ProviderName"),
+                  x.get("providerName"), x.get("provider_name"), x.get("Provider_Name"),
+                  x.get("ClinicName"), x.get("HospitalName"), x.get("FacilityName"),
+                  x.get("GymName"), x.get("SpaName")]:
+            if isinstance(f, str) and f.strip():
+                name = f.strip()
+                break
+        # Use `or`, not `and`/`??` — provider_id=0 is a "missing" sentinel
+        id_val = (x.get("ProviderCode") or x.get("providerCode") or
+                  x.get("NamasNo") or x.get("namasNo") or x.get("namas_no") or
+                  x.get("provider_id") or x.get("ProviderID") or x.get("ProviderId") or
+                  x.get("Id") or x.get("ID") or "")
+        try:
+            lat = float(x.get("latitude") or x.get("lat") or x.get("Lat") or
+                        x.get("Latitude") or x.get("GeoLat") or 0)
+            lng = float(x.get("longitude") or x.get("lng") or x.get("long") or
+                        x.get("Long") or x.get("Longitude") or x.get("GeoLng") or 0)
+        except (TypeError, ValueError):
+            lat, lng = 0.0, 0.0
+        normalised.append({
+            "id":      str(id_val),
+            "name":    name,
+            "address": str(x.get("ProviderAddress") or x.get("provider_address") or
+                           x.get("address") or x.get("Address") or "").strip(),
+            "state":   str(x.get("StateOfOrigin") or x.get("state") or x.get("State") or
+                           x.get("ProviderState") or x.get("Provider_State") or "").strip(),
+            "lga":     str(x.get("CityOfOrigin") or x.get("region") or x.get("town") or
+                           x.get("Town") or x.get("City") or x.get("LGA") or "").strip(),
+            "phone":   str(x.get("phone1") or x.get("Phone1") or x.get("phone") or
+                           x.get("Phone") or x.get("PhoneNo") or x.get("phone2") or "").strip(),
+            "email":   str(x.get("email") or x.get("Email") or x.get("provider_email") or "").strip(),
+            "lat":     lat if lat != 0 else None,
+            "lng":     lng if lng != 0 else None,
+        })
+    # Deduplicate by name|address — keep row with most info
+    seen: Dict[str, dict] = {}
+    for p in normalised:
+        if not p["name"]:
+            continue
+        key = f"{p['name'].lower()}|{p['address'].lower()}"
+        if key not in seen or _provider_score(p) > _provider_score(seen[key]):
+            seen[key] = p
+    # Filter junk
+    return [
+        p for p in seen.values()
+        if p["name"]
+        and not re.search(r"dummy|deactivated|referrals only", p["name"], re.IGNORECASE)
+        and p["id"]
+        and not re.match(r"^[09]+$", p["id"])
+    ]
 
 # ============================================================================
 # TOOLS
@@ -563,101 +623,76 @@ def cancel_annual_screening(visit_id: str) -> dict:
 
 
 @tool
-def get_gym_spa_providers(enrollee_id: str, state: str) -> dict:
+def get_network_providers(enrollee_id: str, provider_type: str, state: str) -> dict:
     """
-    Find gyms and spas covered under a member's health plan in a given Nigerian state.
-    Internally resolves the member's SchemeID from their bio data, then fetches
-    the wellness provider list for that plan.
+    Find in-network providers covered under a member's plan.
+    Handles hospitals, eye clinics, dental clinics, and wellness centres (gyms/spas).
+    Results are cached for 10 minutes per (type, plan) pair.
 
     Args:
-        enrollee_id: Member's enrollee ID (e.g., 21000645/0)
-        state: Nigerian state name, e.g. "Lagos", "Abuja", "Rivers"
+        enrollee_id:   Member's enrollee ID (e.g., 21000645/0)
+        provider_type: "hospital", "eye", "dental", or "wellness"
+        state:         Nigerian state to filter by, e.g. "Lagos", "Abuja", "Rivers"
     """
-    try:
-        if not re.match(r'^[A-Za-z0-9/\-]+$', enrollee_id):
-            return {"found": False, "message": "Invalid enrollee ID format"}
+    provider_type = provider_type.lower().strip()
+    if provider_type not in PROVIDER_ENDPOINTS:
+        return {"found": False,
+                "message": f"Unknown type '{provider_type}'. Use: hospital, eye, dental, wellness"}
 
-        # Step 1: resolve SchemeID — must NOT URL-encode the / in enrollee ID
+    if not re.match(r'^[A-Za-z0-9/\-]+$', enrollee_id):
+        return {"found": False, "message": "Invalid enrollee ID format"}
+
+    _RETRY_MSG = ("We're unable to retrieve the provider list at the moment. "
+                  "Please try again in a few minutes.")
+    try:
+        # Step 1: resolve SchemeID from bio data (/ must not be URL-encoded)
         bio_r = api_client.get_raw(
             f"/EnrolleeProfile/GetEnrolleeBioDataByEnrolleeID?enrolleeid={enrollee_id}"
         )
         if not bio_r.ok or not bio_r.text.strip():
-            return {"found": False, "message": "Could not retrieve member plan details"}
+            return {"found": False, "message": _RETRY_MSG}
 
         bio = _extract_inner(bio_r.json())
         member = bio[0] if isinstance(bio, list) else bio
         scheme_id = member.get("Member_PlanID")
+        plan_name = member.get("Member_Plan", "")
         if not scheme_id:
-            return {"found": False, "message": "Member plan ID not found"}
+            return {"found": False, "message": _RETRY_MSG}
 
-        # Step 2: fetch wellness providers
-        gym_r = api_client.get_raw(
-            f"/ListValues/GetGeneralGymandSpaByPlanCode"
-            f"?SchemeID={scheme_id}&MinimumID=0&NoOfRecords=500&pageSize=500"
-        )
-        if not gym_r.ok:
-            providers = [p for p in FALLBACK_GYMS if p["state"].lower() == state.lower()]
-            return {"found": True, "fallback": True, "count": len(providers), "providers": providers}
+        # Step 2: serve from cache if fresh
+        cache_key = f"{provider_type}:{scheme_id}"
+        now = time.time()
+        cached = _provider_cache.get(cache_key)
+        if cached and now - cached[0] < _PROVIDER_CACHE_TTL:
+            all_providers = cached[1]
+        else:
+            # Step 3: fetch from Prognosis
+            endpoint = PROVIDER_ENDPOINTS[provider_type]
+            prov_r = api_client.get_raw(
+                f"/ListValues/{endpoint}"
+                f"?SchemeID={scheme_id}&MinimumID=0&NoOfRecords=500&pageSize=500"
+            )
+            if not prov_r.ok:
+                return {"found": False, "message": _RETRY_MSG}
 
-        raw = _extract_inner(gym_r.json())
-        if not isinstance(raw, list):
-            raw = raw.get("providers") or raw.get("Providers") or raw.get("items") or raw.get("Items") or []
+            raw = _extract_inner(prov_r.json())
+            if not isinstance(raw, list):
+                raw = (raw.get("providers") or raw.get("Providers") or
+                       raw.get("records") or raw.get("Records") or
+                       raw.get("list") or raw.get("List") or
+                       raw.get("items") or raw.get("Items") or [])
 
-        # Normalise field names
-        normalised = []
-        for x in (raw or []):
-            name_val = next(
-                (f for f in [x.get("provider"), x.get("name"), x.get("Name"),
-                              x.get("ProviderName"), x.get("GymName"), x.get("SpaName"),
-                              x.get("FacilityName"), x.get("HospitalName")]
-                 if isinstance(f, str) and f.strip()), "")
-            try:
-                lat = float(x.get("latitude") or x.get("lat") or x.get("Latitude") or 0)
-                lng = float(x.get("longitude") or x.get("lng") or x.get("Longitude") or 0)
-            except (TypeError, ValueError):
-                lat, lng = 0.0, 0.0
-            normalised.append({
-                "id": str(x.get("ProviderCode") or x.get("providerCode") or x.get("NamasNo") or
-                          x.get("provider_id") or x.get("ProviderID") or ""),
-                "name": name_val.strip(),
-                "address": str(x.get("ProviderAddress") or x.get("address") or x.get("Address") or "").strip(),
-                "state": str(x.get("StateOfOrigin") or x.get("state") or x.get("State") or "").strip(),
-                "lga": str(x.get("CityOfOrigin") or x.get("region") or x.get("town") or
-                           x.get("City") or x.get("LGA") or "").strip(),
-                "phone": str(x.get("phone1") or x.get("Phone1") or x.get("phone") or
-                             x.get("PhoneNo") or x.get("phone2") or "").strip(),
-                "email": str(x.get("email") or x.get("Email") or "").strip(),
-                "lat": lat if lat != 0 else None,
-                "lng": lng if lng != 0 else None,
-            })
+            all_providers = _normalise_providers(raw)
+            _provider_cache[cache_key] = (now, all_providers)
 
-        # Deduplicate by name+address (API returns one row per service line)
-        seen: Dict[str, dict] = {}
-        for p in normalised:
-            if not p["name"]:
-                continue
-            key = f"{p['name'].lower()}|{p['address'].lower()}"
-            def _score(x):
-                return (4 if x["lat"] is not None else 0) + (2 if x["phone"] else 0) + (1 if x["address"] else 0)
-            if key not in seen or _score(p) > _score(seen[key]):
-                seen[key] = p
-
-        # Filter junk rows
-        all_providers = [
-            p for p in seen.values()
-            if p["name"]
-            and not re.search(r"dummy|deactivated|referrals only", p["name"], re.IGNORECASE)
-            and not re.match(r"^[09]+$", p["id"])
-        ]
-
-        # Filter by requested state
+        # Step 4: filter by state
         in_state = [p for p in all_providers if p["state"].lower() == state.lower()]
         providers_to_return = in_state if in_state else all_providers
 
         return {
             "found": True,
-            "fallback": False,
-            "planName": member.get("Member_Plan", ""),
+            "providerType": provider_type,
+            "planName": plan_name,
             "total": len(all_providers),
             "count": len(providers_to_return),
             "stateFilter": state,
@@ -666,9 +701,8 @@ def get_gym_spa_providers(enrollee_id: str, state: str) -> dict:
         }
 
     except Exception as e:
-        print(f"[ERROR] get_gym_spa_providers: {e}")
-        providers = [p for p in FALLBACK_GYMS if p["state"].lower() == state.lower()]
-        return {"found": True, "fallback": True, "count": len(providers), "providers": providers}
+        print(f"[ERROR] get_network_providers: {e}")
+        return {"found": False, "message": _RETRY_MSG}
 
 
 # cancel_annual_screening is intentionally excluded from TOOLS.
@@ -681,7 +715,7 @@ TOOLS = [
     check_annual_screening_eligibility,
     get_screening_providers,
     book_annual_screening,
-    get_gym_spa_providers,
+    get_network_providers,
 ]
 
 # ============================================================================
@@ -699,7 +733,7 @@ Good morning! I'm Favour from Leadway Health. How can I help?
 2. Check My Benefit Limits
 3. Find My Dependants
 4. Book Annual Screening
-5. Find Gyms & Spas
+5. Find Providers (Hospitals / Eye / Dental / Gyms & Spas)
 6. Talk to Agent
 
 AVAILABLE TOOLS:
@@ -708,9 +742,11 @@ AVAILABLE TOOLS:
 - get_dependants: Get list of dependants (requires enrollee ID)
 - check_benefits: Check benefit limits (requires enrollee ID and benefit type)
 - check_annual_screening_eligibility: Check eligibility + get package/tests (requires enrollee ID)
-- get_screening_providers: List screening providers in a state (requires enrollee ID + state)
-- book_annual_screening: Book appointment (requires enrollee ID, provider ID, date YYYY-MM-DD)
-- get_gym_spa_providers: Find gyms/spas covered by member's plan (requires enrollee ID + state)
+- get_screening_providers: List annual screening providers in a state (requires enrollee ID + state)
+- book_annual_screening: Book screening appointment (requires enrollee ID, provider ID, date YYYY-MM-DD)
+- get_network_providers: Find in-network providers by type and state
+    provider_type = "hospital" | "eye" | "dental" | "wellness"
+    (requires enrollee ID, provider_type, state)
 
 CRITICAL TOOL CALLING RULES:
 - When you see 11-digit phone (07x/08x/09x) → IMMEDIATELY call lookup_member_for_id
@@ -718,7 +754,7 @@ CRITICAL TOOL CALLING RULES:
 - When user asks about dependants → call get_dependants with their enrollee ID
 - When user asks about benefits → call check_benefits with their enrollee ID
 - When user asks about annual screening → follow OPTION 4 flow below
-- When user asks about gyms, spas, fitness, wellness → follow OPTION 5 flow below
+- When user asks about hospitals, clinics, eye, dental, gyms, spas, wellness → follow OPTION 5 flow below
 - If you have enrollee ID from earlier in conversation → use it
 - DO NOT ask for verification - just call tools
 
@@ -805,27 +841,38 @@ Step 4 - CONFIRM & BOOK:
 CANCELLATION NOTE: Members CANNOT cancel screenings themselves.
 If a member asks to cancel → tell them: "To cancel your booking, please call 0800-LEADWAY or speak to a Leadway agent (option 6)."
 
-OPTION 5 - FIND GYMS & SPAS:
+OPTION 5 - FIND PROVIDERS:
 Step-by-step flow:
 
-Step 1 - GET STATE:
+Step 1 - ASK TYPE:
 - If you don't have enrollee ID → get it first (phone/email lookup)
-- Ask: "Which state would you like to find a gym or spa in?"
+- Show sub-menu:
+  "What type of provider are you looking for?
+   1. Hospital
+   2. Eye Clinic
+   3. Dental Clinic
+   4. Gym / Spa (Wellness)"
 
-Step 2 - FETCH & SHOW:
-- Call get_gym_spa_providers with enrollee ID and state
-- If fallback=true → tell member the list may not be complete
-- If matchedState=false → tell member no providers were found in that state and show all available
+Step 2 - ASK STATE:
+- Map choice: 1→"hospital", 2→"eye", 3→"dental", 4→"wellness"
+- Ask: "Which state would you like to search in?"
+
+Step 3 - FETCH & SHOW:
+- Call get_network_providers with enrollee ID, provider_type, and state
+- If found=false → show the message from the API (retry message) and stop
+- If matchedState=false → tell member no providers were found in that exact state
+  and that you're showing all available under their plan
 - Show numbered list (max 10), format:
   "1. [name]
       [address], [lga]
       [phone]
   2. ..."
-- If provider has no address/phone, skip those lines
-- End with: "These gyms are covered under your [planName] plan."
+- Skip address/phone lines if empty
+- End with: "These providers are covered under your [planName] plan."
 
-Step 3 - DONE:
-- No booking needed for gyms — member just walks in with their member card
+Step 4 - DONE:
+- For gyms/spas/hospitals/clinics → member just walks in with their Leadway member card
+- No booking required (annual screening has its own separate booking flow)
 
 Keep responses SHORT and DIRECT. Use their enrollee ID if you already have it from earlier in the conversation."""
 
