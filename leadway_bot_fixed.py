@@ -9,9 +9,11 @@ import re
 import math
 import time
 import json
+import uuid
 import requests
 from urllib.parse import quote as _url_quote
 from typing import Optional, Dict, List
+import analytics
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -901,6 +903,8 @@ class LeadwayHealthBot:
         self.chat_history = []
         self.last_request_time = 0
         self.min_delay = 12
+        self.session_id = str(uuid.uuid4())
+        analytics.start_session(self.session_id)
     
     def _wait_for_rate_limit(self):
         now = time.time()
@@ -976,7 +980,9 @@ class LeadwayHealthBot:
     def process_message(self, message: str) -> str:
         try:
             self._wait_for_rate_limit()
-            
+            requested_at = time.time()
+            tools_used: List[str] = []
+
             # FORCE TOOL CALLING: Detect phone numbers in multiple formats
             # Match phone numbers in various formats:
             # +2348188626141, 2348188626141, 08188626141, 081 88626141, etc.
@@ -985,46 +991,42 @@ class LeadwayHealthBot:
                 r'\b0[7-9]\d{1}\s*\d{3}\s*\d{4}\b',       # 08XXXXXXXXX
                 r'\b[7-9]\d{9}\b'                          # XXXXXXXXXX (10 digits)
             ]
-            
+
             email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-            
+
             found_phone = None
             for pattern in phone_patterns:
                 match = re.search(pattern, message)
                 if match:
                     found_phone = match.group()
                     break
-            
+
             found_email = re.search(email_pattern, message)
-            
+
             # If phone number detected, force the tool call
             if found_phone and not found_email:
                 print(f"[SYSTEM] Phone number detected, looking up member...")
-                
-                # Normalize and get all formats to try
                 formats_to_try = self.normalize_phone_number(found_phone)
-                
-                # Try each format until one works
+
                 result = None
                 for phone_format in formats_to_try:
                     print(f"[SYSTEM] Trying format: {phone_format}")
-                    
                     for tool in TOOLS:
                         if tool.name == "lookup_member_for_id":
                             result = tool.invoke({"phone_number": phone_format})
-                            
                             if result.get("found") and result.get("enrollee_id"):
                                 print(f"[SYSTEM] ✓ Member found")
                                 break
-                    
                     if result and result.get("found") and result.get("enrollee_id"):
                         break
-                
-                # Format response - CLEAN and SIMPLE
+
+                tools_used = ["lookup_member_for_id"]
+
                 if result and result.get("found"):
                     enrollee_id = result.get("enrollee_id")
                     name = result.get("name")
-                    
+                    analytics.update_session(self.session_id,
+                                             member_id=enrollee_id, member_name=name)
                     if enrollee_id and name:
                         response_text = f"{name}, your Member ID is: {enrollee_id}"
                     elif enrollee_id:
@@ -1033,78 +1035,77 @@ class LeadwayHealthBot:
                         response_text = "Found your record but Member ID is not available. Please contact support."
                 else:
                     response_text = f"No member found with phone number {found_phone}. Please verify or provide your email."
-                
-                # Update history
+
                 self.chat_history.append(HumanMessage(content=message))
                 self.chat_history.append(AIMessage(content=response_text))
-                
                 if len(self.chat_history) > 10:
                     self.chat_history = self.chat_history[-10:]
-                
+
+                analytics.log_response(self.session_id, message, response_text,
+                                       requested_at, tools_used)
                 self.last_request_time = time.time()
                 return response_text
-            
+
             # Build messages for Claude
             messages = self.chat_history + [HumanMessage(content=message)]
-            
-            # System prompt
-            system_message = SYSTEM_PROMPT
-            
+
             # Call Claude with tools
             response = self.llm_with_tools.invoke(messages)
-            
+
             # Check if Claude wants to use tools
             if hasattr(response, 'tool_calls') and response.tool_calls:
                 print(f"[BOT] Claude calling {len(response.tool_calls)} tool(s)...")
-                
-                # Execute tools and collect results
+
                 tool_results = []
                 for tool_call in response.tool_calls:
                     tool_name = tool_call['name']
                     tool_args = tool_call['args']
-                    
+                    tools_used.append(tool_name)
                     print(f"[BOT] Calling: {tool_name}({tool_args})")
-                    
-                    # Find and execute tool
+
                     for tool in TOOLS:
                         if tool.name == tool_name:
                             result = tool.invoke(tool_args)
-                            tool_results.append({
-                                "tool_name": tool_name,
-                                "result": result
-                            })
+                            tool_results.append({"tool_name": tool_name, "result": result})
+                            # Update session if member was identified
+                            if tool_name in ("lookup_member_for_id", "lookup_member_by_email"):
+                                if result.get("found"):
+                                    analytics.update_session(
+                                        self.session_id,
+                                        member_id=result.get("enrollee_id"),
+                                        member_name=result.get("name"),
+                                    )
                             break
-                
-                # Build context for final response
+
                 tool_context = "\n".join([
                     f"Tool {tr['tool_name']} returned: {json.dumps(tr['result'])}"
                     for tr in tool_results
                 ])
-                
-                # Get final response from Claude WITHOUT tools
                 final_messages = messages + [
                     AIMessage(content=f"I called the tools. Here are the results:\n{tool_context}\n\nNow I'll respond to the user.")
                 ]
-                
                 final_response = self.llm_no_tools.invoke(final_messages)
                 response_text = final_response.content
-                
+
             else:
-                # No tools needed, use response directly
                 response_text = response.content
-            
+
+            # Detect escalation to human agent
+            if re.search(r'talk.{0,10}agent|speak.{0,10}agent|human agent|option 6',
+                         message, re.IGNORECASE):
+                analytics.update_session(self.session_id, escalated=True)
+
             # Update history
             self.chat_history.append(HumanMessage(content=message))
             self.chat_history.append(AIMessage(content=response_text))
-            
-            # Trim history
             if len(self.chat_history) > 10:
                 self.chat_history = self.chat_history[-10:]
-            
+
+            analytics.log_response(self.session_id, message, response_text,
+                                   requested_at, tools_used)
             self.last_request_time = time.time()
-            
             return response_text
-            
+
         except Exception as e:
             print(f"[BOT] ERROR: {e}")
             import traceback
