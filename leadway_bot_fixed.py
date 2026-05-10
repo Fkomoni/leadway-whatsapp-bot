@@ -10,6 +10,7 @@ import math
 import time
 import json
 import requests
+from urllib.parse import quote as _url_quote
 from typing import Optional, Dict, List
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
@@ -246,13 +247,10 @@ def get_dependants(enrollee_id: str) -> dict:
     Returns:
         dict with found and list of dependants
     """
-    result = api_client.get(
-        "EnrolleeProfile/GetEnrolleeDependantsByEnrolleeID",
-        params={"enrolleeid": enrollee_id}
-    )
-    
-    if not result:
+    r = api_client.get_raw(f"/EnrolleeProfile/GetEnrolleeDependantsByEnrolleeID?enrolleeid={enrollee_id}")
+    if not r.ok or not r.text.strip():
         return {"found": False, "dependants": []}
+    result = r.json()
     
     # Handle response structure
     if isinstance(result, dict):
@@ -399,14 +397,12 @@ def check_annual_screening_eligibility(enrollee_id: str) -> dict:
         enrollee_id: Member's enrollee ID (e.g., 21000645/0)
     """
     try:
-        r = api_client._make_request("GET", "AnnualScreening/GetScreeningPackage",
-                                     params={"EnrolleeID": enrollee_id})
+        r = api_client.get_raw(f"/AnnualScreening/GetScreeningPackage?EnrolleeID={enrollee_id}")
         if r.status_code in (404, 405):
             r = api_client._make_request("POST", "AnnualScreening/GetScreeningPackage",
                                          body={"EnrolleeID": enrollee_id})
         if r.status_code in (404, 501):
-            r = api_client._make_request("GET", "Production/GetHealthCheckEligibility",
-                                         params={"enrolleeid": enrollee_id})
+            r = api_client.get_raw(f"/Production/GetHealthCheckEligibility?enrolleeid={enrollee_id}")
         if not r.ok:
             return {"found": False, "message": "Unable to check eligibility"}
 
@@ -449,14 +445,16 @@ def get_screening_providers(enrollee_id: str, state: str) -> dict:
         state: Nigerian state name, e.g. "Lagos", "Abuja", "Rivers"
     """
     try:
-        r = api_client._make_request("GET", "AnnualScreening/GetScreeningProviders",
-                                     params={"EnrolleeID": enrollee_id, "State": state})
+        r = api_client.get_raw(
+            f"/AnnualScreening/GetScreeningProviders?EnrolleeID={enrollee_id}&State={_url_quote(state)}"
+        )
         if r.status_code in (404, 405):
             r = api_client._make_request("POST", "AnnualScreening/GetScreeningProviders",
                                          body={"EnrolleeID": enrollee_id, "State": state})
         if r.status_code in (404, 501):
-            r = api_client._make_request("GET", "Production/GetHealthCheckProviders",
-                                         params={"enrolleeid": enrollee_id, "Region": state})
+            r = api_client.get_raw(
+                f"/Production/GetHealthCheckProviders?enrolleeid={enrollee_id}&Region={_url_quote(state)}"
+            )
         if not r.ok:
             return {"found": False, "providers": [], "message": f"No providers found in {state}"}
 
